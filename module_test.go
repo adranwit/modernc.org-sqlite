@@ -39,10 +39,10 @@ func (m *dummyModule) Connect(ctx vtab.Context, args []string) (vtab.Table, erro
 	return &dummyTable{}, nil
 }
 
-// BestIndex is a no-op stub that accepts any plan.
 func (t *dummyTable) BestIndex(info *vtab.IndexInfo) error {
-	_ = t
-	_ = info
+	// Choose a fixed plan ID so we can verify that IdxNum flows through
+	// sqlite3_index_info into Cursor.Filter.
+	info.IdxNum = 1
 	return nil
 }
 
@@ -58,17 +58,26 @@ func (t *dummyTable) Disconnect() error { return nil }
 // Destroy is a no-op for the dummy table.
 func (t *dummyTable) Destroy() error { return nil }
 
-// Filter initializes the cursor with a fixed set of rows.
 func (c *dummyCursor) Filter(idxNum int, idxStr string, vals []vtab.Value) error {
-	_ = idxNum
 	_ = idxStr
 	_ = vals
-	c.rows = []struct {
-		rowid int64
-		val   string
-	}{
-		{rowid: 1, val: "alpha"},
-		{rowid: 2, val: "beta"},
+	// Ensure that the planner-provided idxNum from BestIndex is propagated.
+	// If idxNum is not 1, return a different rowset so the test would fail.
+	if idxNum == 1 {
+		c.rows = []struct {
+			rowid int64
+			val   string
+		}{
+			{rowid: 1, val: "alpha"},
+			{rowid: 2, val: "beta"},
+		}
+	} else {
+		c.rows = []struct {
+			rowid int64
+			val   string
+		}{
+			{rowid: 1, val: "unexpected"},
+		}
 	}
 	c.pos = 0
 	return nil

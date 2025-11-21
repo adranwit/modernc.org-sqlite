@@ -2339,12 +2339,41 @@ func vtabConnectTrampoline(tls *libc.TLS, db uintptr, pAux uintptr, argc int32, 
 	return sqlite3.SQLITE_OK
 }
 
-// vtabBestIndexTrampoline is a stub xBestIndex implementation that accepts
-// any query plan.
 func vtabBestIndexTrampoline(tls *libc.TLS, pVtab uintptr, pInfo uintptr) int32 {
 	_ = tls
-	_ = pVtab
-	_ = pInfo
+	vtabTables.mu.RLock()
+	gt := vtabTables.m[pVtab]
+	vtabTables.mu.RUnlock()
+	if gt == nil {
+		return sqlite3.SQLITE_ERROR
+	}
+
+	// For now, we only support mapping IdxNum/IdxStr/OrderByConsumed and
+	// cost hints. Constraints and order-by terms are left empty until a full
+	// sqlite3_index_info bridge is implemented.
+	info := &vtab.IndexInfo{}
+	if err := gt.impl.BestIndex(info); err != nil {
+		return sqlite3.SQLITE_ERROR
+	}
+
+	idx := (*sqlite3.Sqlite3_index_info)(unsafe.Pointer(pInfo))
+	idx.FidxNum = int32(info.IdxNum)
+	if info.IdxStr != "" {
+		z, err := libc.CString(info.IdxStr)
+		if err == nil {
+			idx.FidxStr = z
+			idx.FneedToFreeIdxStr = 1
+		}
+	}
+	if info.OrderByConsumed {
+		idx.ForderByConsumed = 1
+	}
+	if info.EstimatedCost != 0 {
+		idx.FestimatedCost = info.EstimatedCost
+	}
+	if info.EstimatedRows != 0 {
+		idx.FestimatedRows = sqlite3.Sqlite3_int64(info.EstimatedRows)
+	}
 	return sqlite3.SQLITE_OK
 }
 

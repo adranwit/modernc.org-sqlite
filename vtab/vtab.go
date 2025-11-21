@@ -72,11 +72,70 @@ type Cursor interface {
 	Close() error
 }
 
+// ConstraintOp describes the operator used in a constraint on a virtual
+// table column. It loosely mirrors the op field of sqlite3_index_constraint.
+type ConstraintOp int
+
+const (
+	OpEQ ConstraintOp = iota
+	OpGT
+	OpLE
+	OpLT
+	OpGE
+	OpMATCH // "MATCH" operator (e.g. for FTS or KNN semantics)
+)
+
+// Constraint describes a single WHERE-clause constraint that SQLite is
+// considering pushing down to the virtual table. Column is the zero-based
+// column index; Op is the operator; Usable indicates whether the constraint is
+// valid for the current plan. ArgIndex is the index into the argv array
+// passed to Cursor.Filter when SQLite asks the vtab to execute a plan that
+// uses this constraint.
+type Constraint struct {
+	Column   int
+	Op       ConstraintOp
+	Usable   bool
+	ArgIndex int
+}
+
+// OrderBy describes a single ORDER BY term for a query involving a virtual
+// table.
+type OrderBy struct {
+	Column int
+	Desc   bool
+}
+
 // IndexInfo holds information about constraints and orderings for a virtual
-// table query. It is intentionally minimal at this stage and can be expanded
-// as the vtab integration is implemented.
+// table query. It is the Go analogue of sqlite3_index_info. The engine's
+// vtabBestIndexTrampoline is responsible for populating this structure from
+// sqlite3_index_info before calling Table.BestIndex, and for writing any
+// fields back after the call.
 type IndexInfo struct {
-	// Placeholder for future fields reflecting sqlite3_index_info.
+	// Constraints lists the WHERE-clause constraints that may be used by the
+	// virtual table to speed up lookups.
+	Constraints []Constraint
+
+	// OrderBy lists the ORDER BY terms in the query. A vtab can set
+	// OrderByConsumed to true to indicate that it returns rows in this order,
+	// allowing SQLite to skip a separate sort.
+	OrderBy []OrderBy
+
+	// The following fields are hints from the vtab back to SQLite.
+
+	// IdxNum and IdxStr are an arbitrary number and string chosen by the
+	// virtual table to identify the chosen plan. They are passed back to the
+	// vtab in Cursor.Filter so it can distinguish between strategies.
+	IdxNum int
+	IdxStr string
+
+	// OrderByConsumed indicates that the virtual table will return rows in the
+	// order requested by OrderBy.
+	OrderByConsumed bool
+
+	// EstimatedCost and EstimatedRows provide planner cost hints analogous to
+	// sqlite3_index_info.estimatedCost / estimatedRows.
+	EstimatedCost float64
+	EstimatedRows int64
 }
 
 // ErrNotImplemented is returned by RegisterModule when the underlying engine
