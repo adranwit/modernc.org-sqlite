@@ -28,6 +28,7 @@ import (
 	"modernc.org/libc"
 	"modernc.org/libc/sys/types"
 	sqlite3 "modernc.org/sqlite/lib"
+	"modernc.org/sqlite/vtab"
 )
 
 var (
@@ -524,7 +525,6 @@ func (s *stmt) Close() (err error) {
 }
 
 // Exec executes a query that doesn't return rows, such as an INSERT or UPDATE.
-//
 //
 // Deprecated: Drivers should implement StmtExecContext instead (or
 // additionally).
@@ -1238,11 +1238,13 @@ func (c *conn) finalize(pstmt uintptr) error {
 }
 
 // int sqlite3_prepare_v2(
-//   sqlite3 *db,            /* Database handle */
-//   const char *zSql,       /* SQL statement, UTF-8 encoded */
-//   int nByte,              /* Maximum length of zSql in bytes. */
-//   sqlite3_stmt **ppStmt,  /* OUT: Statement handle */
-//   const char **pzTail     /* OUT: Pointer to unused portion of zSql */
+//
+//	sqlite3 *db,            /* Database handle */
+//	const char *zSql,       /* SQL statement, UTF-8 encoded */
+//	int nByte,              /* Maximum length of zSql in bytes. */
+//	sqlite3_stmt **ppStmt,  /* OUT: Statement handle */
+//	const char **pzTail     /* OUT: Pointer to unused portion of zSql */
+//
 // );
 func (c *conn) prepareV2(zSQL *uintptr) (pstmt uintptr, err error) {
 	var ppstmt, pptail uintptr
@@ -1297,10 +1299,12 @@ func (c *conn) extendedResultCodes(on bool) error {
 }
 
 // int sqlite3_open_v2(
-//   const char *filename,   /* Database filename (UTF-8) */
-//   sqlite3 **ppDb,         /* OUT: SQLite db handle */
-//   int flags,              /* Flags */
-//   const char *zVfs        /* Name of VFS module to use */
+//
+//	const char *filename,   /* Database filename (UTF-8) */
+//	sqlite3 **ppDb,         /* OUT: SQLite db handle */
+//	int flags,              /* Flags */
+//	const char *zVfs        /* Name of VFS module to use */
+//
 // );
 func (c *conn) openV2(name, vfsName string, flags int32) (uintptr, error) {
 	var p, s, vfs uintptr
@@ -1614,9 +1618,21 @@ func (c *conn) query(ctx context.Context, query string, args []driver.NamedValue
 type Driver struct {
 	// user defined functions that are added to every new connection on Open
 	udfs map[string]*userDefinedFunction
+
+	// modules holds registered virtual table modules that should be added to
+	// every new connection on Open. The actual bridge to sqlite3_create_module
+	// is wired per-connection; this map is process-global.
+	modules map[string]vtab.Module
 }
 
-var d = &Driver{udfs: make(map[string]*userDefinedFunction)}
+var d = &Driver{udfs: make(map[string]*userDefinedFunction), modules: make(map[string]vtab.Module)}
+
+func init() {
+	// Install the module registration hook for the vtab package so that
+	// external extensions can call vtab.RegisterModule while this driver
+	// manages the per-connection wiring.
+	vtab.SetRegisterFunc(registerModule)
+}
 
 func newDriver() *Driver { return d }
 
@@ -1666,7 +1682,86 @@ func (d *Driver) Open(name string) (conn driver.Conn, err error) {
 			return nil, err
 		}
 	}
+	// Register any virtual table modules with this connection so that they are
+	// available for CREATE VIRTUAL TABLE statements.
+	if err := c.registerModules(); err != nil {
+		c.Close()
+		return nil, err
+	}
 	return c, nil
+}
+
+// registerModule records a virtual table module on the driver so that it can
+// be wired into each new connection on Open. The actual sqlite3_create_module
+// invocation is implemented per-connection and will be added in a later
+// phase.
+func registerModule(name string, m vtab.Module) error {
+	if _, exists := d.modules[name]; exists {
+		return fmt.Errorf("sqlite: module %q already registered", name)
+	}
+	d.modules[name] = m
+	return nil
+}
+
+// registerModules installs all globally registered vtab modules on this
+// connection by calling sqlite3_create_module_v2 for each one. The
+// implementation is intentionally minimal at this stage: modules can be
+// created and connected, but scanning always yields an empty result set.
+func (c *conn) registerModules() error {
+	for name, mod := range d.modules {
+		if err := c.registerSingleModule(name, mod); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *conn) registerSingleModule(name string, m vtab.Module) error {
+	// Allocate an ID for this module and remember the Go implementation.
+	vtabModules.mu.Lock()
+	modID := vtabModules.ids.next()
+	vtabModules.m[modID] = &goModule{name: name, impl: m}
+	vtabModules.mu.Unlock()
+
+	nativeModules.mu.Lock()
+	defer nativeModules.mu.Unlock()
+	if _, exists := nativeModules.m[name]; exists {
+		// Module struct already created; nothing more to do for this connection.
+		return nil
+	}
+
+	// Build a sqlite3_module descriptor with trampolines.
+	mod := &sqlite3.Sqlite3_module{}
+	mod.FiVersion = 1
+	mod.FxCreate = cFuncPointer(vtabCreateTrampoline)
+	mod.FxConnect = cFuncPointer(vtabConnectTrampoline)
+	mod.FxBestIndex = cFuncPointer(vtabBestIndexTrampoline)
+	mod.FxDisconnect = cFuncPointer(vtabDisconnectTrampoline)
+	mod.FxDestroy = cFuncPointer(vtabDestroyTrampoline)
+	mod.FxOpen = cFuncPointer(vtabOpenTrampoline)
+	mod.FxClose = cFuncPointer(vtabCloseTrampoline)
+	mod.FxFilter = cFuncPointer(vtabFilterTrampoline)
+	mod.FxNext = cFuncPointer(vtabNextTrampoline)
+	mod.FxEof = cFuncPointer(vtabEofTrampoline)
+	mod.FxColumn = cFuncPointer(vtabColumnTrampoline)
+	mod.FxRowid = cFuncPointer(vtabRowidTrampoline)
+	// Other callbacks (Update, FindFunction, Rename, etc.) remain zero for now.
+
+	// Remember the native module struct to keep it alive.
+	nativeModules.m[name] = mod
+
+	// Prepare C string for module name.
+	zName, err := libc.CString(name)
+	if err != nil {
+		return err
+	}
+
+	// Register the module with this connection. pAux is the module ID so that
+	// trampolines can recover the Go Module implementation.
+	if rc := sqlite3.Xsqlite3_create_module_v2(c.tls, c.db, zName, uintptr(unsafe.Pointer(mod)), modID, 0); rc != sqlite3.SQLITE_OK {
+		return c.errstr(rc)
+	}
+	return nil
 }
 
 // FunctionContext represents the context user defined functions execute in.
@@ -1951,7 +2046,64 @@ var (
 	}{
 		m: make(map[uintptr]AggregateFunction),
 	}
+
+	// vtabModules tracks Go virtual table modules registered via the vtab
+	// package. Each module is identified by an integer ID used as pAux when
+	// calling sqlite3_create_module_v2, so that trampolines can recover the
+	// Go Module implementation.
+	vtabModules = struct {
+		mu  sync.RWMutex
+		m   map[uintptr]*goModule
+		ids idGen
+	}{
+		m: make(map[uintptr]*goModule),
+	}
+
+	// nativeModules holds sqlite3_module instances for registered modules. We
+	// keep them in Go memory so their addresses remain stable for the C layer.
+	nativeModules = struct {
+		mu sync.RWMutex
+		m  map[string]*sqlite3.Sqlite3_module
+	}{
+		m: make(map[string]*sqlite3.Sqlite3_module),
+	}
+
+	// vtabTables maps sqlite3_vtab* (pVtab) to the corresponding Go Table
+	// implementation.
+	vtabTables = struct {
+		mu sync.RWMutex
+		m  map[uintptr]*goTable
+	}{
+		m: make(map[uintptr]*goTable),
+	}
+
+	// vtabCursors maps sqlite3_vtab_cursor* (pCursor) to the corresponding Go
+	// Cursor implementation.
+	vtabCursors = struct {
+		mu sync.RWMutex
+		m  map[uintptr]*goCursor
+	}{
+		m: make(map[uintptr]*goCursor),
+	}
 )
+
+// goModule wraps a vtab.Module implementation with its name.
+type goModule struct {
+	name string
+	impl vtab.Module
+}
+
+// goTable wraps a vtab.Table implementation and remembers its module.
+type goTable struct {
+	mod  *goModule
+	impl vtab.Table
+}
+
+// goCursor wraps a vtab.Cursor implementation and remembers its table.
+type goCursor struct {
+	table *goTable
+	impl  vtab.Cursor
+}
 
 type idGen struct {
 	bitset []uint64
@@ -2074,6 +2226,320 @@ func inverseTrampoline(tls *libc.TLS, ctx uintptr, argc int32, argv uintptr) {
 	if err != nil {
 		setErrorResult(err)
 	}
+}
+
+// vtabCreateTrampoline is the xCreate callback. It invokes the corresponding
+// Go vtab.Module.Create method, declares a default schema based on argv, and
+// allocates a sqlite3_vtab.
+func vtabCreateTrampoline(tls *libc.TLS, db uintptr, pAux uintptr, argc int32, argv uintptr, ppVtab uintptr, pzErr uintptr) int32 {
+	gm := lookupGoModule(pAux)
+	if gm == nil {
+		setVtabError(tls, pzErr, fmt.Sprintf("vtab: unknown module id %d", pAux))
+		return sqlite3.SQLITE_ERROR
+	}
+	args := extractVtabArgs(tls, argc, argv)
+	// Declare a simple schema: CREATE TABLE <tableName>(<cols...>) based on
+	// argv. This matches common usage where the virtual table columns mirror
+	// the arguments to USING.
+	if len(args) >= 3 {
+		cols := ""
+		if len(args) > 3 {
+			cols = strings.Join(args[3:], ",")
+		} else {
+			cols = "x"
+		}
+		schema := fmt.Sprintf("CREATE TABLE %s(%s)", args[2], cols)
+		zSchema, err := libc.CString(schema)
+		if err != nil {
+			setVtabError(tls, pzErr, err.Error())
+			return sqlite3.SQLITE_ERROR
+		}
+		defer libc.Xfree(tls, zSchema)
+		if rc := sqlite3.Xsqlite3_declare_vtab(tls, db, zSchema); rc != sqlite3.SQLITE_OK {
+			setVtabError(tls, pzErr, fmt.Sprintf("declare_vtab failed: rc=%d", rc))
+			return rc
+		}
+	}
+	ctx := vtab.Context{}
+	tbl, err := gm.impl.Create(ctx, args)
+	if err != nil {
+		setVtabError(tls, pzErr, err.Error())
+		return sqlite3.SQLITE_ERROR
+	}
+	sz := unsafe.Sizeof(sqlite3.Sqlite3_vtab{})
+	p := sqlite3.Xsqlite3_malloc(tls, int32(sz))
+	if p == 0 {
+		setVtabError(tls, pzErr, "vtab: out of memory")
+		return sqlite3.SQLITE_NOMEM
+	}
+	mem := (*libc.RawMem)(unsafe.Pointer(p))[:sz:sz]
+	for i := range mem {
+		mem[i] = 0
+	}
+	*(*uintptr)(unsafe.Pointer(ppVtab)) = p
+
+	// Track Go table for this sqlite3_vtab*.
+	gt := &goTable{mod: gm, impl: tbl}
+	vtabTables.mu.Lock()
+	vtabTables.m[p] = gt
+	vtabTables.mu.Unlock()
+	return sqlite3.SQLITE_OK
+}
+
+// vtabConnectTrampoline is the xConnect callback. It mirrors
+// vtabCreateTrampoline but calls Module.Connect.
+func vtabConnectTrampoline(tls *libc.TLS, db uintptr, pAux uintptr, argc int32, argv uintptr, ppVtab uintptr, pzErr uintptr) int32 {
+	gm := lookupGoModule(pAux)
+	if gm == nil {
+		setVtabError(tls, pzErr, fmt.Sprintf("vtab: unknown module id %d", pAux))
+		return sqlite3.SQLITE_ERROR
+	}
+	args := extractVtabArgs(tls, argc, argv)
+	if len(args) >= 3 {
+		cols := ""
+		if len(args) > 3 {
+			cols = strings.Join(args[3:], ",")
+		} else {
+			cols = "x"
+		}
+		schema := fmt.Sprintf("CREATE TABLE %s(%s)", args[2], cols)
+		zSchema, err := libc.CString(schema)
+		if err != nil {
+			setVtabError(tls, pzErr, err.Error())
+			return sqlite3.SQLITE_ERROR
+		}
+		defer libc.Xfree(tls, zSchema)
+		if rc := sqlite3.Xsqlite3_declare_vtab(tls, db, zSchema); rc != sqlite3.SQLITE_OK {
+			setVtabError(tls, pzErr, fmt.Sprintf("declare_vtab failed: rc=%d", rc))
+			return rc
+		}
+	}
+	ctx := vtab.Context{}
+	tbl, err := gm.impl.Connect(ctx, args)
+	if err != nil {
+		setVtabError(tls, pzErr, err.Error())
+		return sqlite3.SQLITE_ERROR
+	}
+	sz := unsafe.Sizeof(sqlite3.Sqlite3_vtab{})
+	p := sqlite3.Xsqlite3_malloc(tls, int32(sz))
+	if p == 0 {
+		setVtabError(tls, pzErr, "vtab: out of memory")
+		return sqlite3.SQLITE_NOMEM
+	}
+	mem := (*libc.RawMem)(unsafe.Pointer(p))[:sz:sz]
+	for i := range mem {
+		mem[i] = 0
+	}
+	*(*uintptr)(unsafe.Pointer(ppVtab)) = p
+
+	gt := &goTable{mod: gm, impl: tbl}
+	vtabTables.mu.Lock()
+	vtabTables.m[p] = gt
+	vtabTables.mu.Unlock()
+	return sqlite3.SQLITE_OK
+}
+
+// vtabBestIndexTrampoline is a stub xBestIndex implementation that accepts
+// any query plan.
+func vtabBestIndexTrampoline(tls *libc.TLS, pVtab uintptr, pInfo uintptr) int32 {
+	_ = tls
+	_ = pVtab
+	_ = pInfo
+	return sqlite3.SQLITE_OK
+}
+
+// vtabDisconnectTrampoline is xDisconnect. It frees the sqlite3_vtab
+// allocated by xCreate/xConnect.
+func vtabDisconnectTrampoline(tls *libc.TLS, pVtab uintptr) int32 {
+	vtabTables.mu.RLock()
+	gt := vtabTables.m[pVtab]
+	vtabTables.mu.RUnlock()
+	if gt != nil {
+		_ = gt.impl.Disconnect()
+		vtabTables.mu.Lock()
+		delete(vtabTables.m, pVtab)
+		vtabTables.mu.Unlock()
+	}
+	sqlite3.Xsqlite3_free(tls, pVtab)
+	return sqlite3.SQLITE_OK
+}
+
+// vtabDestroyTrampoline is xDestroy. Currently identical to Disconnect.
+func vtabDestroyTrampoline(tls *libc.TLS, pVtab uintptr) int32 {
+	vtabTables.mu.RLock()
+	gt := vtabTables.m[pVtab]
+	vtabTables.mu.RUnlock()
+	if gt != nil {
+		_ = gt.impl.Destroy()
+		vtabTables.mu.Lock()
+		delete(vtabTables.m, pVtab)
+		vtabTables.mu.Unlock()
+	}
+	sqlite3.Xsqlite3_free(tls, pVtab)
+	return sqlite3.SQLITE_OK
+}
+
+// vtabOpenTrampoline is xOpen. It allocates an empty sqlite3_vtab_cursor.
+func vtabOpenTrampoline(tls *libc.TLS, pVtab uintptr, ppCursor uintptr) int32 {
+	vtabTables.mu.RLock()
+	gt := vtabTables.m[pVtab]
+	vtabTables.mu.RUnlock()
+	if gt == nil {
+		return sqlite3.SQLITE_ERROR
+	}
+
+	curImpl, err := gt.impl.Open()
+	if err != nil {
+		return sqlite3.SQLITE_ERROR
+	}
+	sz := unsafe.Sizeof(sqlite3.Sqlite3_vtab_cursor{})
+	p := sqlite3.Xsqlite3_malloc(tls, int32(sz))
+	if p == 0 {
+		return sqlite3.SQLITE_NOMEM
+	}
+	mem := (*libc.RawMem)(unsafe.Pointer(p))[:sz:sz]
+	for i := range mem {
+		mem[i] = 0
+	}
+	*(*uintptr)(unsafe.Pointer(ppCursor)) = p
+
+	gc := &goCursor{table: gt, impl: curImpl}
+	vtabCursors.mu.Lock()
+	vtabCursors.m[p] = gc
+	vtabCursors.mu.Unlock()
+	return sqlite3.SQLITE_OK
+}
+
+// vtabCloseTrampoline is xClose. It frees the sqlite3_vtab_cursor.
+func vtabCloseTrampoline(tls *libc.TLS, pCursor uintptr) int32 {
+	vtabCursors.mu.RLock()
+	gc := vtabCursors.m[pCursor]
+	vtabCursors.mu.RUnlock()
+	if gc != nil {
+		_ = gc.impl.Close()
+		vtabCursors.mu.Lock()
+		delete(vtabCursors.m, pCursor)
+		vtabCursors.mu.Unlock()
+	}
+	sqlite3.Xsqlite3_free(tls, pCursor)
+	return sqlite3.SQLITE_OK
+}
+
+// vtabFilterTrampoline is xFilter. The initial implementation performs no
+// filtering and always yields an empty result set.
+func vtabFilterTrampoline(tls *libc.TLS, pCursor uintptr, idxNum int32, idxStr uintptr, argc int32, argv uintptr) int32 {
+	vtabCursors.mu.RLock()
+	gc := vtabCursors.m[pCursor]
+	vtabCursors.mu.RUnlock()
+	if gc == nil {
+		return sqlite3.SQLITE_ERROR
+	}
+
+	var idxStrGo string
+	if idxStr != 0 {
+		idxStrGo = libc.GoString(idxStr)
+	}
+	vals := functionArgs(tls, argc, argv)
+	if err := gc.impl.Filter(int(idxNum), idxStrGo, vals); err != nil {
+		return sqlite3.SQLITE_ERROR
+	}
+	return sqlite3.SQLITE_OK
+}
+
+// vtabNextTrampoline is xNext. With the current empty implementation, it is a
+// no-op.
+func vtabNextTrampoline(tls *libc.TLS, pCursor uintptr) int32 {
+	_ = tls
+	vtabCursors.mu.RLock()
+	gc := vtabCursors.m[pCursor]
+	vtabCursors.mu.RUnlock()
+	if gc == nil {
+		return sqlite3.SQLITE_ERROR
+	}
+	if err := gc.impl.Next(); err != nil {
+		return sqlite3.SQLITE_ERROR
+	}
+	return sqlite3.SQLITE_OK
+}
+
+// vtabEofTrampoline is xEof. It always reports EOF so that virtual tables
+// appear empty.
+func vtabEofTrampoline(tls *libc.TLS, pCursor uintptr) int32 {
+	_ = tls
+	vtabCursors.mu.RLock()
+	gc := vtabCursors.m[pCursor]
+	vtabCursors.mu.RUnlock()
+	if gc == nil || gc.impl.Eof() {
+		return 1
+	}
+	return 0
+}
+
+// vtabColumnTrampoline is xColumn. It currently always returns NULL.
+func vtabColumnTrampoline(tls *libc.TLS, pCursor uintptr, ctx uintptr, iCol int32) int32 {
+	vtabCursors.mu.RLock()
+	gc := vtabCursors.m[pCursor]
+	vtabCursors.mu.RUnlock()
+	if gc == nil {
+		sqlite3.Xsqlite3_result_null(tls, ctx)
+		return sqlite3.SQLITE_OK
+	}
+	val, err := gc.impl.Column(int(iCol))
+	if err != nil {
+		setVtabError(tls, ctx, err.Error())
+		sqlite3.Xsqlite3_result_error_code(tls, ctx, sqlite3.SQLITE_ERROR)
+		return sqlite3.SQLITE_ERROR
+	}
+	if err := functionReturnValue(tls, ctx, val); err != nil {
+		sqlite3.Xsqlite3_result_error_code(tls, ctx, sqlite3.SQLITE_ERROR)
+		return sqlite3.SQLITE_ERROR
+	}
+	return sqlite3.SQLITE_OK
+}
+
+// vtabRowidTrampoline is xRowid. It currently returns rowid 0.
+func vtabRowidTrampoline(tls *libc.TLS, pCursor uintptr, pRowid uintptr) int32 {
+	_ = tls
+	vtabCursors.mu.RLock()
+	gc := vtabCursors.m[pCursor]
+	vtabCursors.mu.RUnlock()
+	if gc == nil {
+		*(*int64)(unsafe.Pointer(pRowid)) = 0
+		return sqlite3.SQLITE_OK
+	}
+	rowid, err := gc.impl.Rowid()
+	if err != nil {
+		*(*int64)(unsafe.Pointer(pRowid)) = 0
+		return sqlite3.SQLITE_ERROR
+	}
+	*(*int64)(unsafe.Pointer(pRowid)) = rowid
+	return sqlite3.SQLITE_OK
+}
+
+func lookupGoModule(id uintptr) *goModule {
+	vtabModules.mu.RLock()
+	defer vtabModules.mu.RUnlock()
+	return vtabModules.m[id]
+}
+
+func extractVtabArgs(tls *libc.TLS, argc int32, argv uintptr) []string {
+	args := make([]string, argc)
+	for i := int32(0); i < argc; i++ {
+		cstr := *(*uintptr)(unsafe.Pointer(argv + uintptr(i)*unsafe.Sizeof(uintptr(0))))
+		args[i] = libc.GoString(cstr)
+	}
+	return args
+}
+
+func setVtabError(tls *libc.TLS, pzErr uintptr, msg string) {
+	if pzErr == 0 {
+		return
+	}
+	z, err := libc.CString(msg)
+	if err != nil {
+		return
+	}
+	*(*uintptr)(unsafe.Pointer(pzErr)) = z
 }
 
 func valueTrampoline(tls *libc.TLS, ctx uintptr) {
